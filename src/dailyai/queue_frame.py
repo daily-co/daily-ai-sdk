@@ -23,6 +23,14 @@ class LLMResponseEndQueueFrame(QueueFrame):
     pass
 
 
+class UserStartedSpeakingFrame(QueueFrame):
+    pass
+
+
+class UserStoppedSpeakingFrame(QueueFrame):
+    pass
+
+
 @dataclass()
 class AudioQueueFrame(QueueFrame):
     data: bytes
@@ -42,8 +50,19 @@ class SpriteQueueFrame(QueueFrame):
 @dataclass()
 class TextQueueFrame(QueueFrame):
     text: str
+    
+@dataclass()
+class BotSpeechTextFrame(TextQueueFrame):
+    save_in_context: bool
 
-
+@dataclass()
+class BotTTSCompletedFrame(BotSpeechTextFrame):
+    pass
+    
+@dataclass()
+class BotTranscriptionFrame(BotSpeechTextFrame):
+    pass
+    
 @dataclass()
 class TranscriptionQueueFrame(TextQueueFrame):
     participantId: str

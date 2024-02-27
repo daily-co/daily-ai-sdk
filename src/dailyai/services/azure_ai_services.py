@@ -42,14 +42,16 @@ class AzureTTSService(TTSService):
             yield result.audio_data[44:]
         elif result.reason == ResultReason.Canceled:
             cancellation_details = result.cancellation_details
-            self.logger.info("Speech synthesis canceled: {}".format(cancellation_details.reason))
+            self.logger.info("Speech synthesis canceled: {}".format(
+                cancellation_details.reason))
             if cancellation_details.reason == CancellationReason.Error:
-                self.logger.info("Error details: {}".format(cancellation_details.error_details))
+                self.logger.info("Error details: {}".format(
+                    cancellation_details.error_details))
 
 
 class AzureLLMService(LLMService):
-    def __init__(self, *, api_key, endpoint, api_version="2023-12-01-preview", model):
-        super().__init__()
+    def __init__(self, *, api_key, endpoint, api_version="2023-12-01-preview", model, context=None):
+        super().__init__(context)
         self._model: str = model
 
         self._client = AsyncAzureOpenAI(
@@ -102,7 +104,8 @@ class AzureImageGenServiceREST(ImageGenService):
 
     async def run_image_gen(self, sentence) -> tuple[str, bytes]:
         url = f"{self._azure_endpoint}openai/images/generations:submit?api-version={self._api_version}"
-        headers = {"api-key": self._api_key, "Content-Type": "application/json"}
+        headers = {"api-key": self._api_key,
+                   "Content-Type": "application/json"}
         body = {
             # Enter your prompt text here
             "prompt": sentence,
@@ -112,11 +115,9 @@ class AzureImageGenServiceREST(ImageGenService):
         async with self._aiohttp_session.post(
             url, headers=headers, json=body
         ) as submission:
-            print(f"submission: {submission}")
             # We never get past this line, because this header isn't
             # defined on a 429 response, but something is eating our exceptions!
             operation_location = submission.headers['operation-location']
-            print(f"submission status: {submission.status}")
             status = ""
             attempts_left = 120
             json_response = None
@@ -139,5 +140,4 @@ class AzureImageGenServiceREST(ImageGenService):
             async with self._aiohttp_session.get(image_url) as response:
                 image_stream = io.BytesIO(await response.content.read())
                 image = Image.open(image_stream)
-                print("i got an image file!")
                 return (image_url, image.tobytes())

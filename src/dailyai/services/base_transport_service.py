@@ -1,20 +1,83 @@
 from abc import abstractmethod
 import asyncio
+import copy
+import functools
 import itertools
 import logging
 import queue
 import threading
 import time
 from typing import AsyncGenerator
+import numpy as np
+import pyaudio
+import torch
+import torchaudio
+from enum import Enum
+import datetime
+
+from typing import AsyncGenerator, AsyncIterable, BinaryIO, Iterable
+from dailyai.queue_aggregators import LLMAssistantContextAggregator, LLMUserContextAggregator
 
 from dailyai.queue_frame import (
     AudioQueueFrame,
+    BotTranscriptionFrame,
     EndStreamQueueFrame,
     ImageQueueFrame,
     QueueFrame,
     SpriteQueueFrame,
     StartStreamQueueFrame,
+    BotTranscriptionFrame,
+    BotTTSCompletedFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame
 )
+
+torch.set_num_threads(1)
+
+model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                              model='silero_vad',
+                              force_reload=False)
+
+(get_speech_timestamps,
+ save_audio,
+ read_audio,
+ VADIterator,
+ collect_chunks) = utils
+
+# Taken from utils_vad.py
+
+
+def validate(model,
+             inputs: torch.Tensor):
+    with torch.no_grad():
+        outs = model(inputs)
+    return outs
+
+# Provided by Alexander Veysov
+
+
+def int2float(sound):
+    abs_max = np.abs(sound).max()
+    sound = sound.astype('float32')
+    if abs_max > 0:
+        sound *= 1/32768
+    sound = sound.squeeze()  # depends on the use case
+    return sound
+
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+SAMPLE_RATE = 16000
+CHUNK = int(SAMPLE_RATE / 10)
+
+audio = pyaudio.PyAudio()
+
+
+class VADState(Enum):
+    QUIET = 1
+    STARTING = 2
+    SPEAKING = 3
+    STOPPING = 4
 
 
 class BaseTransportService():
@@ -31,6 +94,17 @@ class BaseTransportService():
         self._speaker_enabled = kwargs.get("speaker_enabled") or False
         self._speaker_sample_rate = kwargs.get("speaker_sample_rate") or 16000
         self._fps = kwargs.get("fps") or 8
+        self._vad_start_s = kwargs.get("vad_start_s") or 0.2
+        self._vad_stop_s = kwargs.get("vad_stop_s") or 0.8
+        self._context = kwargs.get("context") or []
+
+        self._vad_samples = 1536
+        vad_frame_s = self._vad_samples / SAMPLE_RATE
+        self._vad_start_frames = round(self._vad_start_s / vad_frame_s)
+        self._vad_stop_frames = round(self._vad_stop_s / vad_frame_s)
+        self._vad_starting_count = 0
+        self._vad_stopping_count = 0
+        self._vad_state = VADState.QUIET
 
         duration_minutes = kwargs.get("duration_minutes") or 10
         self._expiration = time.time() + duration_minutes * 60
@@ -41,6 +115,8 @@ class BaseTransportService():
         self._threadsafe_send_queue = queue.Queue()
 
         self._images = None
+        self._user_is_speaking = False
+        self._current_phrase = ""
 
         try:
             self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
@@ -52,20 +128,72 @@ class BaseTransportService():
 
         self._logger: logging.Logger = logging.getLogger()
 
+    def update_messages(self, new_context: list[dict[str, str]], task: asyncio.Task | None):
+        if task:
+            if not task.cancelled():
+                self._current_phrase = ""
+                self._context = new_context
+
+
+
+    async def run_pipeline(self, frame):
+        # TODO-CB: This exception for missing class gets eaten!
+        await self._runner(frame)
+
+    async def run_conversation(self, runner: Iterable[QueueFrame]
+                               | AsyncIterable[QueueFrame]
+                               | asyncio.Queue[QueueFrame],
+                               ) -> AsyncGenerator[QueueFrame, None]:
+        current_response_task = None
+        self._runner = runner
+
+        async for frame in self.get_receive_frames():
+            if isinstance(frame, EndStreamQueueFrame):
+                break
+            # elif not isinstance(frame, TranscriptionQueueFrame):
+                # continue
+            # TODO-CB: Verify this is an accurate replacement
+            # if hasattr(frame, 'participantId') and frame.participantId == self._my_participant_id:
+            # if not isinstance(frame, UserStoppedSpeakingFrame):
+            #     continue
+
+            if current_response_task and isinstance(frame, UserStartedSpeakingFrame):
+                # TODO-CB: Maybe not always interrupt? Are there frame types we can pass through?
+                current_response_task.cancel()
+                self.interrupt()
+
+            # self._current_phrase += " " + frame.text
+           # current_llm_context = copy.deepcopy(self._context)
+            current_response_task = asyncio.create_task(
+                self.run_pipeline(
+                    frame)
+            )
+            current_response_task.add_done_callback(
+                functools.partial(self.update_messages, self._context)
+            )
+
     async def run(self):
         self._prerun()
 
-        async_output_queue_marshal_task = asyncio.create_task(self._marshal_frames())
+        async_output_queue_marshal_task = asyncio.create_task(
+            self._marshal_frames())
 
-        self._camera_thread = threading.Thread(target=self._run_camera, daemon=True)
+        self._camera_thread = threading.Thread(
+            target=self._run_camera, daemon=True)
         self._camera_thread.start()
 
-        self._frame_consumer_thread = threading.Thread(target=self._frame_consumer, daemon=True)
+        self._frame_consumer_thread = threading.Thread(
+            target=self._frame_consumer, daemon=True)
         self._frame_consumer_thread.start()
 
         if self._speaker_enabled:
-            self._receive_audio_thread = threading.Thread(target=self._receive_audio, daemon=True)
-            self._receive_audio_thread.start()
+            # TODO-CB: This is interesting
+            # self._receive_audio_thread = threading.Thread(
+            #     target=self._receive_audio, daemon=True)
+            # self._receive_audio_thread.start()
+
+            self._vad_thread = threading.Thread(target=self._vad, daemon=True)
+            self._vad_thread.start()
 
         try:
             while (
@@ -88,7 +216,9 @@ class BaseTransportService():
         self._frame_consumer_thread.join()
 
         if self._speaker_enabled:
-            self._receive_audio_thread.join()
+            # TODO-CB: this was breaking example 2?
+            # self._receive_audio_thread.join()
+            pass
 
     def _post_run(self):
         # Note that this function must be idempotent! It can be called multiple times
@@ -122,6 +252,56 @@ class BaseTransportService():
     def _prerun(self):
         pass
 
+    def _vad(self):
+        # CB: Starting silero VAD stuff
+        # TODO-CB: Probably need to force virtual speaker creation if we're
+        # going to build this in?
+        # TODO-CB: pyaudio installation
+        while not self._stop_threads.is_set():
+            audio_chunk = self.read_audio_frames(self._vad_samples)
+            audio_int16 = np.frombuffer(audio_chunk, np.int16)
+            audio_float32 = int2float(audio_int16)
+            new_confidence = model(
+                torch.from_numpy(audio_float32), 16000).item()
+            speaking = new_confidence > 0.5
+
+            if speaking:
+                match self._vad_state:
+                    case VADState.QUIET:
+                        self._vad_state = VADState.STARTING
+                        self._vad_starting_count = 1
+                    case VADState.STARTING:
+                        self._vad_starting_count += 1
+                    case VADState.STOPPING:
+                        self._vad_state = VADState.SPEAKING
+                        self._vad_stopping_count = 0
+            else:
+                match self._vad_state:
+                    case VADState.STARTING:
+                        self._vad_state = VADState.QUIET
+                        self._vad_starting_count = 0
+                    case VADState.SPEAKING:
+                        self._vad_state = VADState.STOPPING
+                        self._vad_stopping_count = 1
+                    case VADState.STOPPING:
+                        self._vad_stopping_count += 1
+
+            if self._vad_state == VADState.STARTING and self._vad_starting_count >= self._vad_start_frames:
+                asyncio.run_coroutine_threadsafe(
+                    self.receive_queue.put(
+                        UserStartedSpeakingFrame()), self._loop
+                )
+                self.interrupt()
+                self._vad_state = VADState.SPEAKING
+                self._vad_starting_count = 0
+            if self._vad_state == VADState.STOPPING and self._vad_stopping_count >= self._vad_stop_frames:
+                asyncio.run_coroutine_threadsafe(
+                    self.receive_queue.put(
+                        UserStoppedSpeakingFrame()), self._loop
+                )
+                self._vad_state = VADState.QUIET
+                self._vad_stopping_count = 0
+
     async def _marshal_frames(self):
         while True:
             frame: QueueFrame | list = await self.send_queue.get()
@@ -131,6 +311,7 @@ class BaseTransportService():
                 break
 
     def interrupt(self):
+        self._logger.debug("!!! Setting interrupta")
         self._is_interrupted.set()
 
     async def get_receive_frames(self) -> AsyncGenerator[QueueFrame, None]:
@@ -181,13 +362,19 @@ class BaseTransportService():
         self._logger.info("🎬 Starting frame consumer thread")
         b = bytearray()
         smallest_write_size = 3200
+        largest_write_size = 8000
         all_audio_frames = bytearray()
         while True:
             try:
                 frames_or_frame: QueueFrame | list[QueueFrame] = (
                     self._threadsafe_send_queue.get()
                 )
-                if isinstance(frames_or_frame, QueueFrame):
+                if isinstance(frames_or_frame, AudioQueueFrame) and len(frames_or_frame.data) > largest_write_size:
+                    # subdivide large audio frames to enable interruption
+                    frames = []
+                    for i in range(0, len(frames_or_frame.data), largest_write_size):
+                        frames.append(AudioQueueFrame(frames_or_frame.data[i : i+largest_write_size]))
+                elif isinstance(frames_or_frame, QueueFrame):
                     frames: list[QueueFrame] = [frames_or_frame]
                 elif isinstance(frames_or_frame, list):
                     frames: list[QueueFrame] = frames_or_frame
@@ -195,6 +382,7 @@ class BaseTransportService():
                     raise Exception("Unknown type in output queue")
 
                 for frame in frames:
+                    # self._logger.debug(f"Transport frame consumer got frame: {type(frame)}")
                     if isinstance(frame, EndStreamQueueFrame):
                         self._logger.info("Stopping frame consumer thread")
                         self._threadsafe_send_queue.task_done()
@@ -205,7 +393,6 @@ class BaseTransportService():
                         if frame:
                             if isinstance(frame, AudioQueueFrame):
                                 chunk = frame.data
-
                                 all_audio_frames.extend(chunk)
 
                                 b.extend(chunk)
@@ -213,12 +400,16 @@ class BaseTransportService():
                                     len(b) % smallest_write_size
                                 )
                                 if truncated_length:
-                                    self.write_frame_to_mic(bytes(b[:truncated_length]))
+                                    self.write_frame_to_mic(
+                                        bytes(b[:truncated_length]))
                                     b = b[truncated_length:]
                             elif isinstance(frame, ImageQueueFrame):
                                 self._set_image(frame.image)
                             elif isinstance(frame, SpriteQueueFrame):
                                 self._set_images(frame.images)
+                            elif isinstance(frame, BotTTSCompletedFrame):
+                                asyncio.run_coroutine_threadsafe(
+                                    self.receive_queue.put(BotTranscriptionFrame(frame.text, frame.save_in_context)), self._loop)
                         elif len(b):
                             self.write_frame_to_mic(bytes(b))
                             b = bytearray()
@@ -227,7 +418,8 @@ class BaseTransportService():
                         # can cause static in the audio stream.
                         if len(b):
                             truncated_length = len(b) - (len(b) % 160)
-                            self.write_frame_to_mic(bytes(b[:truncated_length]))
+                            self.write_frame_to_mic(
+                                bytes(b[:truncated_length]))
                             b = bytearray()
 
                         if isinstance(frame, StartStreamQueueFrame):
@@ -240,5 +432,6 @@ class BaseTransportService():
 
                 b = bytearray()
             except Exception as e:
-                self._logger.error(f"Exception in frame_consumer: {e}, {len(b)}")
+                self._logger.error(
+                    f"Exception in frame_consumer: {e}, {len(b)}")
                 raise e

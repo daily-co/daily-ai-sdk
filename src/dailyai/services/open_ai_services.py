@@ -10,8 +10,8 @@ from dailyai.services.ai_services import LLMService, ImageGenService
 
 
 class OpenAILLMService(LLMService):
-    def __init__(self, *, api_key, model="gpt-4"):
-        super().__init__()
+    def __init__(self, *, api_key, model="gpt-4-turbo-preview", context=None):
+        super().__init__(context)
         self._model = model
         self._client = AsyncOpenAI(api_key=api_key)
 
@@ -57,7 +57,6 @@ class OpenAIImageGenService(ImageGenService):
     ):
         super().__init__(image_size=image_size)
         self._model = model
-        print(f"api key: {api_key}")
         self._client = AsyncOpenAI(api_key=api_key)
         self._aiohttp_session = aiohttp_session
 

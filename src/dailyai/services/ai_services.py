@@ -2,10 +2,15 @@ import asyncio
 import io
 import logging
 import time
+import datetime
+
+from numpy import true_divide
+import pysbd
 import wave
 
 from dailyai.queue_frame import (
     AudioQueueFrame,
+    BotSpeechTextFrame,
     ControlQueueFrame,
     EndStreamQueueFrame,
     ImageQueueFrame,
@@ -13,7 +18,9 @@ from dailyai.queue_frame import (
     LLMResponseEndQueueFrame,
     QueueFrame,
     TextQueueFrame,
+    BotTTSCompletedFrame,
     TranscriptionQueueFrame,
+    UserStoppedSpeakingFrame
 )
 
 from abc import abstractmethod
@@ -61,8 +68,6 @@ class AIService:
             else:
                 raise Exception("Frames must be an iterable or async iterable")
 
-            async for output_frame in self.finalize():
-                yield output_frame
         except Exception as e:
             self.logger.error("Exception occurred while running AI service", e)
             raise e
@@ -80,6 +85,11 @@ class AIService:
 
 
 class LLMService(AIService):
+
+    def __init__(self, context=None):
+        super().__init__()
+        self._context = context
+
     @abstractmethod
     async def run_llm_async(self, messages) -> AsyncGenerator[str, None]:
         yield ""
@@ -89,7 +99,21 @@ class LLMService(AIService):
         pass
 
     async def process_frame(self, frame: QueueFrame) -> AsyncGenerator[QueueFrame, None]:
-        if isinstance(frame, LLMMessagesQueueFrame):
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            # Then we're in conversation mode with VAD;
+            # use the global shared context for completion
+            # but also yield the UserStoppedSpeakingFrame for downstream timing
+            yield frame
+            self.logger.debug("Starting LLM")
+            async for text_chunk in self.run_llm_async(self._context):
+                self.logger.debug("Yielding LLM")
+                yield TextQueueFrame(text_chunk)
+            self.logger.debug("Finished LLM")
+            yield LLMResponseEndQueueFrame()
+        elif isinstance(frame, LLMMessagesQueueFrame):
+            # It's an LLMMessagesQueueFrame directly created in an
+            # example.
+            # TODO-CB: Clean this up?
             async for text_chunk in self.run_llm_async(frame.messages):
                 yield TextQueueFrame(text_chunk)
             yield LLMResponseEndQueueFrame()
@@ -98,9 +122,10 @@ class LLMService(AIService):
 
 
 class TTSService(AIService):
-    def __init__(self, aggregate_sentences=True):
+    def __init__(self, aggregate_sentences=True, split_sentences=False):
         super().__init__()
         self.aggregate_sentences: bool = aggregate_sentences
+        self.split_sentences: bool = split_sentences
         self.current_sentence: str = ""
 
     # Some TTS services require a specific sample rate. We default to 16k
@@ -116,30 +141,47 @@ class TTSService(AIService):
 
     async def process_frame(self, frame: QueueFrame) -> AsyncGenerator[QueueFrame, None]:
         if not isinstance(frame, TextQueueFrame):
+            # We don't want transcription frames, which are a subclass
             yield frame
             return
 
-        text: str | None = None
-        if not self.aggregate_sentences:
-            text = frame.text
+        # TODO-CB: Clean this up
+        if isinstance(frame, TranscriptionQueueFrame):
+            yield frame
+            return
+        text = []
+        if self.split_sentences:
+            seg = pysbd.Segmenter(language="en", clean=False)
+            text = seg.segment(frame.text)
+        elif not self.aggregate_sentences:
+            text = [frame.text]
         else:
             self.current_sentence += frame.text
             if self.current_sentence.endswith((".", "?", "!")):
-                text = self.current_sentence
+                text = [self.current_sentence]
                 self.current_sentence = ""
-
-        if text:
-            async for audio_chunk in self.run_tts(text):
+        
+        if isinstance(frame, BotSpeechTextFrame):
+            save_in_context = frame.save_in_context
+        else:
+            save_in_context = True
+        print(f"text is {text}")
+        for sentence in text:
+            self.logger.debug(f"Starting TTS for: {sentence}")
+            async for audio_chunk in self.run_tts(sentence):
+                self.logger.debug("Yielding TTS")
                 yield AudioQueueFrame(audio_chunk)
+            self.logger.debug("Finished TTS")
+            yield BotTTSCompletedFrame(sentence, save_in_context)
 
     async def finalize(self):
         if self.current_sentence:
             async for audio_chunk in self.run_tts(self.current_sentence):
-                yield AudioQueueFrame(audio_chunk)
+               yield AudioQueueFrame(audio_chunk)
 
     # Convenience function to send the audio for a sentence to the given queue
-    async def say(self, sentence, queue: asyncio.Queue):
-        await self.run_to_queue(queue, [TextQueueFrame(sentence)])
+    async def say(self, sentence, queue: asyncio.Queue, save_in_context=False):
+        await self.run_to_queue(queue, [BotSpeechTextFrame(sentence, save_in_context)])
 
 
 class ImageGenService(AIService):
@@ -200,8 +242,9 @@ class FrameLogger(AIService):
 
     async def process_frame(self, frame: QueueFrame) -> AsyncGenerator[QueueFrame, None]:
         if isinstance(frame, (AudioQueueFrame, ImageQueueFrame)):
-            self.logger.info(f"{self.prefix}: {type(frame)}")
+            self.logger.info(
+                f"{datetime.datetime.utcnow().isoformat()} {self.prefix}: {type(frame)}")
         else:
-            print(f"{self.prefix}: {frame}")
+            print(f"{datetime.datetime.utcnow().isoformat()} {self.prefix}: {frame}")
 
         yield frame
