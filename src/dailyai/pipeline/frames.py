@@ -9,6 +9,7 @@ class Frame:
         return f"{self.__class__.__name__}"
 
 
+
 class ControlFrame(Frame):
     # Control frames should contain no instance data, so
     # equality is based solely on the class.
@@ -77,6 +78,21 @@ class TextFrame(Frame):
 
     def __str__(self):
         return f'{self.__class__.__name__}: "{self.text}"'
+
+
+@dataclass()
+class BotSpeechTextFrame(TextFrame):
+    save_in_context: bool
+
+
+@dataclass()
+class BotTTSCompletedFrame(BotSpeechTextFrame):
+    pass
+
+
+@dataclass()
+class BotTranscriptionFrame(BotSpeechTextFrame):
+    pass
 
 
 @dataclass()
